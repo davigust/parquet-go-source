@@ -25,8 +25,8 @@ type AzBlockBlob struct {
 	writerOptions WriterOptions
 
 	// read-related fields
-	offset        int64
 	fileSize      int64
+	offset        int64
 	readerOptions ReaderOptions
 }
 
@@ -37,19 +37,26 @@ var (
 	errWriteNotOpened = errors.New("Write url not opened")
 )
 
+// ReaderOptions is used to configure azblob read behavior, including HTTP, retry, and logging settings
 type ReaderOptions struct {
-	HTTPSender   pipeline.Factory
+	// HTTPSender configures the sender of HTTP requests
+	HTTPSender pipeline.Factory
+	// Retry configures the built-in retry policy behavior.
 	RetryOptions azblob.RetryOptions
-	Log          pipeline.LogOptions
-
-	RetryReaderOptions azblob.RetryReaderOptions
+	// Log configures the pipeline's logging infrastructure indicating what information is logged and where.
+	Log pipeline.LogOptions
 }
 
+// WriterOptions is used to configure azblob write behavior, including HTTP, retry, and logging settings
 type WriterOptions struct {
-	BlockSize    int
-	HTTPSender   pipeline.Factory
+	// HTTPSender configures the sender of HTTP requests
+	HTTPSender pipeline.Factory
+	// Retry configures the built-in retry policy behavior.
 	RetryOptions azblob.RetryOptions
-	Log          pipeline.LogOptions
+	// Log configures the pipeline's logging infrastructure indicating what information is logged and where.
+	Log pipeline.LogOptions
+	// Parallelism limits the number of go routines created to read blob content (0 = default)
+	Parallelism int
 }
 
 // NewAzBlobFileWriter creates an Azure Blob FileWriter, to be used with NewParquetWriter
@@ -122,7 +129,7 @@ func (s *AzBlockBlob) Read(p []byte) (n int, err error) {
 		toRead = count
 	}
 
-	body := resp.Body(s.readerOptions.RetryReaderOptions)
+	body := resp.Body(azblob.RetryReaderOptions{})
 	bytesRead, err := io.ReadFull(body, p[:toRead])
 	if err != nil {
 		return 0, err
@@ -233,7 +240,7 @@ func (s *AzBlockBlob) Create(URL string) (source.ParquetFile, error) {
 		defer close(done)
 
 		// upload data and signal done when complete
-		_, err := azblob.UploadStreamToBlockBlob(ctx, reader, *blobURL, azblob.UploadStreamToBlockBlobOptions{BufferSize: o.BlockSize})
+		_, err := azblob.UploadStreamToBlockBlob(ctx, reader, *blobURL, azblob.UploadStreamToBlockBlobOptions{MaxBuffers: o.Parallelism})
 		if err != nil {
 			readerPipeSource.CloseWithError(err)
 		}
