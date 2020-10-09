@@ -11,10 +11,10 @@ import (
 	"github.com/xitongsys/parquet-go/source"
 )
 
-// blockBlob is ParquetFile for azblob
-type blockBlob struct {
+// AzBlockBlob is ParquetFile for azblob
+type AzBlockBlob struct {
 	ctx          context.Context
-	url          *url.URL
+	URL          *url.URL
 	credential   azblob.Credential
 	blockBlobURL *azblob.BlockBlobURL
 
@@ -26,7 +26,6 @@ type blockBlob struct {
 
 	// read-related fields
 	offset        int64
-	whence        int
 	fileSize      int64
 	readerOptions ReaderOptions
 }
@@ -39,22 +38,23 @@ var (
 )
 
 type ReaderOptions struct {
-	// HTTPSender configures the sender of HTTP requests
-	HTTPSender pipeline.Factory
+	HTTPSender   pipeline.Factory
+	RetryOptions azblob.RetryOptions
+	Log          pipeline.LogOptions
 
-	RetryOptions azblob.RetryReaderOptions
+	RetryReaderOptions azblob.RetryReaderOptions
 }
 
 type WriterOptions struct {
-	BlockSize int
-
-	// HTTPSender configures the sender of HTTP requests
-	HTTPSender pipeline.Factory
+	BlockSize    int
+	HTTPSender   pipeline.Factory
+	RetryOptions azblob.RetryOptions
+	Log          pipeline.LogOptions
 }
 
 // NewAzBlobFileWriter creates an Azure Blob FileWriter, to be used with NewParquetWriter
 func NewAzBlobFileWriter(ctx context.Context, URL string, credential azblob.Credential, options WriterOptions) (source.ParquetFile, error) {
-	file := &blockBlob{
+	file := &AzBlockBlob{
 		ctx:           ctx,
 		credential:    credential,
 		writerOptions: options,
@@ -65,7 +65,7 @@ func NewAzBlobFileWriter(ctx context.Context, URL string, credential azblob.Cred
 
 // NewAzBlobFileReader creates an Azure Blob FileReader, to be used with NewParquetReader
 func NewAzBlobFileReader(ctx context.Context, URL string, credential azblob.Credential, options ReaderOptions) (source.ParquetFile, error) {
-	file := &blockBlob{
+	file := &AzBlockBlob{
 		ctx:           ctx,
 		credential:    credential,
 		readerOptions: options,
@@ -75,36 +75,31 @@ func NewAzBlobFileReader(ctx context.Context, URL string, credential azblob.Cred
 }
 
 // Seek tracks the offset for the next Read. Has no effect on Write.
-func (s *blockBlob) Seek(offset int64, whence int) (int64, error) {
+func (s *AzBlockBlob) Seek(offset int64, whence int) (int64, error) {
 	if whence < io.SeekStart || whence > io.SeekEnd {
 		return 0, errWhence
 	}
 
-	if s.fileSize > 0 {
-		switch whence {
-		case io.SeekStart:
-			if offset < 0 || offset > s.fileSize {
-				return 0, errInvalidOffset
-			}
-		case io.SeekCurrent:
-			offset += s.offset
-			if offset < 0 || offset > s.fileSize {
-				return 0, errInvalidOffset
-			}
-		case io.SeekEnd:
-			if offset > -1 || -offset > s.fileSize {
-				return 0, errInvalidOffset
-			}
-		}
+	switch whence {
+	case io.SeekStart:
+		offset = offset
+	case io.SeekCurrent:
+		offset = s.offset + offset
+	case io.SeekEnd:
+		offset = s.fileSize + offset
+	}
+
+	if offset < 0 || offset > s.fileSize {
+		return 0, errInvalidOffset
 	}
 
 	s.offset = offset
-	s.whence = whence
+
 	return s.offset, nil
 }
 
 // Read up to len(p) bytes into p and return the number of bytes read
-func (s *blockBlob) Read(p []byte) (n int, err error) {
+func (s *AzBlockBlob) Read(p []byte) (n int, err error) {
 	if s.blockBlobURL == nil {
 		return 0, errReadNotOpened
 	}
@@ -127,7 +122,7 @@ func (s *blockBlob) Read(p []byte) (n int, err error) {
 		toRead = count
 	}
 
-	body := resp.Body(s.readerOptions.RetryOptions)
+	body := resp.Body(s.readerOptions.RetryReaderOptions)
 	bytesRead, err := io.ReadFull(body, p[:toRead])
 	if err != nil {
 		return 0, err
@@ -139,7 +134,7 @@ func (s *blockBlob) Read(p []byte) (n int, err error) {
 }
 
 // Write len(p) bytes from p
-func (s *blockBlob) Write(p []byte) (n int, err error) {
+func (s *AzBlockBlob) Write(p []byte) (n int, err error) {
 	if s.blockBlobURL == nil {
 		return 0, errWriteNotOpened
 	}
@@ -155,7 +150,7 @@ func (s *blockBlob) Write(p []byte) (n int, err error) {
 
 // Close signals write completion and cleans up any
 // open streams. Will block until pending uploads are complete.
-func (s *blockBlob) Close() error {
+func (s *AzBlockBlob) Close() error {
 	var err error
 
 	if s.pipeWriter != nil {
@@ -171,11 +166,11 @@ func (s *blockBlob) Close() error {
 }
 
 // Open creates a new block blob to perform reads
-func (s *blockBlob) Open(URL string) (source.ParquetFile, error) {
+func (s *AzBlockBlob) Open(URL string) (source.ParquetFile, error) {
 	var u *url.URL
-	if len(URL) == 0 {
+	if len(URL) == 0 && s.URL != nil {
 		// ColumnBuffer passes in an empty string for name
-		u = s.url
+		u = s.URL
 	} else {
 		var err error
 		if u, err = url.Parse(URL); err != nil {
@@ -183,7 +178,7 @@ func (s *blockBlob) Open(URL string) (source.ParquetFile, error) {
 		}
 	}
 
-	blobURL := azblob.NewBlockBlobURL(*u, azblob.NewPipeline(s.credential, azblob.PipelineOptions{HTTPSender: s.readerOptions.HTTPSender}))
+	blobURL := azblob.NewBlockBlobURL(*u, azblob.NewPipeline(s.credential, azblob.PipelineOptions{HTTPSender: s.readerOptions.HTTPSender, Retry: s.readerOptions.RetryOptions, Log: s.readerOptions.Log}))
 
 	fileSize := int64(-1)
 	props, err := blobURL.GetProperties(s.ctx, azblob.BlobAccessConditions{})
@@ -191,9 +186,9 @@ func (s *blockBlob) Open(URL string) (source.ParquetFile, error) {
 		fileSize = props.ContentLength()
 	}
 
-	pf := &blockBlob{
+	pf := &AzBlockBlob{
 		ctx:           s.ctx,
-		url:           u,
+		URL:           u,
 		credential:    s.credential,
 		blockBlobURL:  &blobURL,
 		fileSize:      fileSize,
@@ -204,11 +199,11 @@ func (s *blockBlob) Open(URL string) (source.ParquetFile, error) {
 }
 
 // Create a new blob url to perform writes
-func (s *blockBlob) Create(URL string) (source.ParquetFile, error) {
+func (s *AzBlockBlob) Create(URL string) (source.ParquetFile, error) {
 	var u *url.URL
-	if len(URL) == 0 {
+	if len(URL) == 0 && s.URL != nil {
 		// ColumnBuffer passes in an empty string for name
-		u = s.url
+		u = s.URL
 	} else {
 		var err error
 		if u, err = url.Parse(URL); err != nil {
@@ -216,16 +211,16 @@ func (s *blockBlob) Create(URL string) (source.ParquetFile, error) {
 		}
 	}
 
-	blobURL := azblob.NewBlockBlobURL(*u, azblob.NewPipeline(s.credential, azblob.PipelineOptions{HTTPSender: s.writerOptions.HTTPSender}))
+	blobURL := azblob.NewBlockBlobURL(*u, azblob.NewPipeline(s.credential, azblob.PipelineOptions{HTTPSender: s.writerOptions.HTTPSender, Retry: s.writerOptions.RetryOptions, Log: s.writerOptions.Log}))
 
 	// get account properties to validate credentials
 	if _, err := blobURL.GetAccountInfo(s.ctx); err != nil {
 		return nil, err
 	}
 
-	pf := &blockBlob{
+	pf := &AzBlockBlob{
 		ctx:           s.ctx,
-		url:           u,
+		URL:           u,
 		credential:    s.credential,
 		blockBlobURL:  &blobURL,
 		writerOptions: s.writerOptions,
